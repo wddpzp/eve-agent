@@ -1,5 +1,6 @@
+import { deepseek } from "@ai-sdk/deepseek";
 import { defineAgent } from "eve";
 
 export default defineAgent({
-  model: "anthropic/claude-sonnet-5",
+  model: deepseek("deepseek-chat"), // 换 "deepseek-reasoner" 用 R1 思考模型
 });
