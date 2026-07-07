@@ -4,10 +4,21 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 const EVE_BASE = process.env.NEXT_PUBLIC_EVE_BASE_URL ?? "https://eve-agent-ten.vercel.app";
-const STORE_KEY = "eve-console-v1";
+const LIST_KEY = "eve-console-sessions-v1";
+const MAX_SESSIONS = 30;
 
 type Mode = "conversation" | "task";
 type Status = "ready" | "submitted" | "streaming" | "error";
+
+interface SavedSession {
+  sessionId: string;
+  mode: Mode;
+  title: string;
+  token: string | null;
+  events: EveEvent[];
+  status: string | null; // 最后的 session 状态:waiting / completed / failed
+  updatedAt: number;
+}
 
 interface EveEvent {
   type: string;
@@ -61,6 +72,7 @@ export default function Page() {
   const [status, setStatus] = useState<Status>("ready");
   const [error, setError] = useState<string | null>(null);
   const [restored, setRestored] = useState(false);
+  const [sessions, setSessions] = useState<SavedSession[]>([]);
 
   const tokenRef = useRef<string | null>(null);
   const seenRef = useRef(0);
@@ -75,18 +87,22 @@ export default function Page() {
     eventsRef.current = events;
   }, [events]);
 
-  // 挂载时从 localStorage 恢复上次会话(只读渲染 + 保留续写游标)
+  // 挂载时读取会话列表,并把最近一条恢复到视图
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORE_KEY);
+      const raw = localStorage.getItem(LIST_KEY);
       if (!raw) return;
-      const s = JSON.parse(raw) as { sessionId?: string; mode?: Mode; token?: string | null; events?: EveEvent[] };
-      if (s.sessionId && s.events?.length) {
-        setSessionId(s.sessionId);
-        if (s.mode) setMode(s.mode);
-        tokenRef.current = s.token ?? null;
-        seenRef.current = s.events.length;
-        setEvents(s.events);
+      const list = JSON.parse(raw) as SavedSession[];
+      if (!Array.isArray(list) || list.length === 0) return;
+      setSessions(list);
+      const latest = list[0];
+      if (latest?.sessionId && latest.events?.length) {
+        setSessionId(latest.sessionId);
+        setMode(latest.mode);
+        tokenRef.current = latest.token ?? null;
+        seenRef.current = latest.events.length;
+        eventsRef.current = latest.events;
+        setEvents(latest.events);
         setRestored(true);
       }
     } catch {
@@ -101,14 +117,25 @@ export default function Page() {
   }, [events]);
 
   function persist(sid: string, m: Mode) {
-    try {
-      localStorage.setItem(
-        STORE_KEY,
-        JSON.stringify({ sessionId: sid, mode: m, token: tokenRef.current, events: eventsRef.current }),
-      );
-    } catch {
-      /* ignore */
-    }
+    const evs = eventsRef.current;
+    const entry: SavedSession = {
+      sessionId: sid,
+      mode: m,
+      title: firstUserMessage(evs) || "(空)",
+      token: tokenRef.current,
+      events: evs,
+      status: deriveConsole(evs).sessionStatus,
+      updatedAt: Date.now(),
+    };
+    setSessions((prev) => {
+      const next = [entry, ...prev.filter((s) => s.sessionId !== sid)].slice(0, MAX_SESSIONS);
+      try {
+        localStorage.setItem(LIST_KEY, JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
   }
 
   async function stream(sid: string, signal: AbortSignal) {
@@ -139,7 +166,11 @@ export default function Page() {
         batch.push(ev);
         if (TERMINAL.has(ev.type)) stop = true;
       }
-      if (batch.length) setEvents((p) => [...p, ...batch]);
+      if (batch.length) {
+        // 同步维护 eventsRef,保证 stream() 返回后 persist() 读到的是完整事件
+        eventsRef.current = [...eventsRef.current, ...batch];
+        setEvents(eventsRef.current);
+      }
       if (stop) {
         await reader.cancel();
         break;
@@ -206,6 +237,7 @@ export default function Page() {
     setStatus("ready");
   }
 
+  // 「新会话」:只清空当前视图,历史列表保留
   function reset() {
     abortRef.current?.abort();
     tokenRef.current = null;
@@ -216,11 +248,34 @@ export default function Page() {
     setError(null);
     setStatus("ready");
     setRestored(false);
-    try {
-      localStorage.removeItem(STORE_KEY);
-    } catch {
-      /* ignore */
-    }
+  }
+
+  // 从历史加载一条会话(恢复事件 + 续写游标)
+  function loadSession(s: SavedSession) {
+    if (busy) return;
+    abortRef.current?.abort();
+    tokenRef.current = s.token ?? null;
+    seenRef.current = s.events.length;
+    eventsRef.current = s.events;
+    setSessionId(s.sessionId);
+    setMode(s.mode);
+    setEvents(s.events);
+    setStatus("ready");
+    setError(null);
+    setRestored(true);
+  }
+
+  function deleteSession(sid: string) {
+    setSessions((prev) => {
+      const next = prev.filter((s) => s.sessionId !== sid);
+      try {
+        localStorage.setItem(LIST_KEY, JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+    if (sid === sessionId) reset();
   }
 
   const canFollow = mode === "conversation" && !!sessionId && sessionStatus === "waiting" && !busy;
@@ -241,6 +296,7 @@ export default function Page() {
               <div className="tag">durable agent · mission control</div>
             </div>
           </div>
+          <a className="navlink" href="/sdk">eve/client SDK 演示 →</a>
 
           <div className="card">
             <p className="lbl">模式</p>
@@ -299,6 +355,45 @@ export default function Page() {
             )}
             {error && <p className="err">✗ {error}</p>}
           </div>
+
+          {/* 会话历史 */}
+          {sessions.length > 0 && (
+            <div className="card">
+              <p className="lbl">会话历史 · {sessions.length}</p>
+              <div className="sess-list">
+                {sessions.map((s) => (
+                  <div
+                    key={s.sessionId}
+                    className={`sess ${s.sessionId === sessionId ? "on" : ""}`}
+                    onClick={() => loadSession(s)}
+                    title={s.sessionId}
+                  >
+                    <div className="sess-main">
+                      <div className="sess-title">{s.title}</div>
+                      <div className="sess-meta">
+                        <span className={`sess-badge ${s.mode}`}>{s.mode === "task" ? "task" : "conv"}</span>
+                        <span className={`sess-status ${s.status ?? ""}`}>{s.status ?? "—"}</span>
+                        <span>· {timeAgo(s.updatedAt)}</span>
+                      </div>
+                    </div>
+                    <button
+                      className="sess-del"
+                      title="删除"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteSession(s.sessionId);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+              {mode === "conversation" && sessionId && sessionStatus === "waiting" && (
+                <p className="hint">当前会话停在 waiting,直接在上面输入框「发送下一句」即可续。task 会话是终态,加载后只读。</p>
+              )}
+            </div>
+          )}
 
           {/* curl 面板 */}
           <div className="card">
@@ -502,6 +597,24 @@ async function readJson<T>(res: Response): Promise<T> {
 function short(v: unknown): string {
   const s = typeof v === "string" ? v : JSON.stringify(v, null, 2);
   return s.length > 800 ? s.slice(0, 800) + "…" : s;
+}
+
+function firstUserMessage(events: EveEvent[]): string {
+  for (const ev of events) {
+    if (ev.type === "message.received") {
+      const m = (ev.data as { message?: string } | undefined)?.message;
+      if (m) return m.length > 40 ? m.slice(0, 40) + "…" : m;
+    }
+  }
+  return "";
+}
+
+function timeAgo(ts: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return "刚刚";
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  return `${Math.floor(s / 86400)} 天前`;
 }
 
 function pickPhase(status: Status, busy: boolean, sessionStatus: string | null): "run" | "done" | "wait" | "fail" | "idle" {
