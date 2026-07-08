@@ -1,134 +1,51 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { useEveAgent } from "eve/react";
+import type { HandleMessageStreamEvent, SessionState } from "eve/client";
 
-const EVE_BASE = process.env.NEXT_PUBLIC_EVE_BASE_URL ?? "https://eve-agent-ten.vercel.app";
-const LIST_KEY = "eve-console-sessions-v1";
-const MAX_SESSIONS = 30;
+// 聊天页:useEveAgent(eve/react 官方 hook)原生处理 流式 + 续写 + HITL。
+// 打同源 /eve/v1/*(见 app/eve/v1/[...path] 代理)。多会话靠 key 重挂子组件。
 
-type Mode = "conversation" | "task";
-type Status = "ready" | "submitted" | "streaming" | "error";
+const LIST_KEY = "eve-chat-hook-v1";
+const MAX = 40;
 
-interface SavedSession {
-  sessionId: string;
-  mode: Mode;
+interface SavedThread {
+  id: string; // 稳定的本地 thread id(= 重挂 key)
   title: string;
-  token: string | null;
-  events: EveEvent[];
-  status: string | null; // 最后的 session 状态:waiting / completed / failed
+  events: HandleMessageStreamEvent[];
+  session: SessionState | undefined;
   updatedAt: number;
 }
 
-interface EveEvent {
-  type: string;
-  data?: Record<string, unknown>;
-  meta?: { at?: string };
-}
-
-const DEMO_SCHEMA = {
-  type: "object",
-  properties: { answer: { type: "string" }, confidence: { type: "number" } },
-  required: ["answer"],
-} as const;
-
-const TERMINAL = new Set(["session.completed", "session.failed", "session.waiting", "input.requested"]);
-
-interface DerivedTool {
-  name: string;
-  input?: unknown;
-  output?: unknown;
-  status: "running" | "done" | "failed";
-}
-
-interface Turn {
-  turnId: string;
-  user?: string;
-  blocks: string[];
-  live: string;
-  reasoning: string;
-  tools: DerivedTool[];
-  callIndex: Record<string, number>;
-  usageIn: number;
-  usageOut: number;
-  finishReason?: string;
-  status: "running" | "completed" | "failed";
-  result?: unknown;
-}
-
-interface Derived {
-  turns: Turn[];
-  sessionStatus: string | null;
-  totalIn: number;
-  totalOut: number;
-}
+/* ================= 父:会话列表 + 装载当前 thread ================= */
 
 export default function Page() {
-  const [mode, setMode] = useState<Mode>("task");
-  const [message, setMessage] = useState("用一句话介绍你自己");
-  const [useSchema, setUseSchema] = useState(false);
-  const [events, setEvents] = useState<EveEvent[]>([]);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [status, setStatus] = useState<Status>("ready");
-  const [error, setError] = useState<string | null>(null);
-  const [restored, setRestored] = useState(false);
-  const [sessions, setSessions] = useState<SavedSession[]>([]);
-
-  const tokenRef = useRef<string | null>(null);
-  const seenRef = useRef(0);
-  const abortRef = useRef<AbortController | null>(null);
-  const eventsRef = useRef<EveEvent[]>([]);
-  const streamRef = useRef<HTMLDivElement | null>(null);
-
-  const busy = status === "submitted" || status === "streaming";
-  const { turns, sessionStatus, totalIn, totalOut } = useMemo<Derived>(() => deriveConsole(events), [events]);
+  const [threads, setThreads] = useState<SavedThread[]>([]);
+  const [activeId, setActiveId] = useState<string>(""); // 空到客户端 effect 再定,避免 hydration 不一致
 
   useEffect(() => {
-    eventsRef.current = events;
-  }, [events]);
-
-  // 挂载时读取会话列表,并把最近一条恢复到视图
-  useEffect(() => {
+    let list: SavedThread[] = [];
     try {
       const raw = localStorage.getItem(LIST_KEY);
-      if (!raw) return;
-      const list = JSON.parse(raw) as SavedSession[];
-      if (!Array.isArray(list) || list.length === 0) return;
-      setSessions(list);
-      const latest = list[0];
-      if (latest?.sessionId && latest.events?.length) {
-        setSessionId(latest.sessionId);
-        setMode(latest.mode);
-        tokenRef.current = latest.token ?? null;
-        seenRef.current = latest.events.length;
-        eventsRef.current = latest.events;
-        setEvents(latest.events);
-        setRestored(true);
-      }
+      if (raw) list = JSON.parse(raw) as SavedThread[];
     } catch {
-      /* ignore */
+      list = [];
+    }
+    if (Array.isArray(list) && list.length) {
+      setThreads(list);
+      setActiveId(list[0].id);
+    } else {
+      setActiveId(freshId());
     }
   }, []);
 
-  // 新事件时自动滚到底
-  useEffect(() => {
-    const el = streamRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [events]);
+  const active = threads.find((t) => t.id === activeId);
 
-  function persist(sid: string, m: Mode) {
-    const evs = eventsRef.current;
-    const entry: SavedSession = {
-      sessionId: sid,
-      mode: m,
-      title: firstUserMessage(evs) || "(空)",
-      token: tokenRef.current,
-      events: evs,
-      status: deriveConsole(evs).sessionStatus,
-      updatedAt: Date.now(),
-    };
-    setSessions((prev) => {
-      const next = [entry, ...prev.filter((s) => s.sessionId !== sid)].slice(0, MAX_SESSIONS);
+  function upsert(t: SavedThread) {
+    setThreads((prev) => {
+      const next = [t, ...prev.filter((x) => x.id !== t.id)].slice(0, MAX);
       try {
         localStorage.setItem(LIST_KEY, JSON.stringify(next));
       } catch {
@@ -138,136 +55,13 @@ export default function Page() {
     });
   }
 
-  async function stream(sid: string, signal: AbortSignal) {
-    const res = await fetch(`/api/eve/session/${sid}/stream?startIndex=${seenRef.current}`, { signal });
-    if (!res.body) return;
-    setStatus("streaming");
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop() ?? "";
-      const batch: EveEvent[] = [];
-      let stop = false;
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t) continue;
-        let ev: EveEvent;
-        try {
-          ev = JSON.parse(t) as EveEvent;
-        } catch {
-          continue;
-        }
-        seenRef.current += 1;
-        batch.push(ev);
-        if (TERMINAL.has(ev.type)) stop = true;
-      }
-      if (batch.length) {
-        // 同步维护 eventsRef,保证 stream() 返回后 persist() 读到的是完整事件
-        eventsRef.current = [...eventsRef.current, ...batch];
-        setEvents(eventsRef.current);
-      }
-      if (stop) {
-        await reader.cancel();
-        break;
-      }
-    }
+  function newChat() {
+    setActiveId(freshId());
   }
 
-  async function send() {
-    if (!message.trim() || busy) return;
-    setError(null);
-    setStatus("submitted");
-    const controller = new AbortController();
-    abortRef.current = controller;
-    const isFollow = mode === "conversation" && !!sessionId && sessionStatus === "waiting";
-    try {
-      let sid = sessionId;
-      if (isFollow) {
-        const res = await fetch(`/api/eve/session/${sid}`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ continuationToken: tokenRef.current, message }),
-          signal: controller.signal,
-        });
-        const j = await readJson<{ continuationToken?: string; error?: string }>(res);
-        if (!res.ok || j.error) throw new Error(j.error ?? `HTTP ${res.status}`);
-        tokenRef.current = j.continuationToken ?? tokenRef.current;
-      } else {
-        const body: Record<string, unknown> = { mode, message };
-        if (mode === "task" && useSchema) body.outputSchema = DEMO_SCHEMA;
-        const res = await fetch(`/api/eve/session`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
-        const j = await readJson<{ sessionId?: string; continuationToken?: string; error?: string }>(res);
-        if (!res.ok || j.error || !j.sessionId) throw new Error(j.error ?? `HTTP ${res.status}`);
-        tokenRef.current = j.continuationToken ?? null;
-        seenRef.current = 0;
-        eventsRef.current = [];
-        setEvents([]);
-        setSessionId(j.sessionId);
-        setRestored(false);
-        sid = j.sessionId;
-      }
-      setMessage("");
-      await stream(sid!, controller.signal);
-      persist(sid!, mode);
-      setStatus("ready");
-    } catch (e) {
-      if (controller.signal.aborted) {
-        setStatus("ready");
-        return;
-      }
-      setError(e instanceof Error ? e.message : String(e));
-      setStatus("error");
-    } finally {
-      abortRef.current = null;
-    }
-  }
-
-  function stop() {
-    abortRef.current?.abort();
-    setStatus("ready");
-  }
-
-  // 「新会话」:只清空当前视图,历史列表保留
-  function reset() {
-    abortRef.current?.abort();
-    tokenRef.current = null;
-    seenRef.current = 0;
-    eventsRef.current = [];
-    setSessionId(null);
-    setEvents([]);
-    setError(null);
-    setStatus("ready");
-    setRestored(false);
-  }
-
-  // 从历史加载一条会话(恢复事件 + 续写游标)
-  function loadSession(s: SavedSession) {
-    if (busy) return;
-    abortRef.current?.abort();
-    tokenRef.current = s.token ?? null;
-    seenRef.current = s.events.length;
-    eventsRef.current = s.events;
-    setSessionId(s.sessionId);
-    setMode(s.mode);
-    setEvents(s.events);
-    setStatus("ready");
-    setError(null);
-    setRestored(true);
-  }
-
-  function deleteSession(sid: string) {
-    setSessions((prev) => {
-      const next = prev.filter((s) => s.sessionId !== sid);
+  function del(id: string) {
+    setThreads((prev) => {
+      const next = prev.filter((x) => x.id !== id);
       try {
         localStorage.setItem(LIST_KEY, JSON.stringify(next));
       } catch {
@@ -275,335 +69,255 @@ export default function Page() {
       }
       return next;
     });
-    if (sid === sessionId) reset();
+    if (id === activeId) setActiveId(freshId());
   }
-
-  const canFollow = mode === "conversation" && !!sessionId && sessionStatus === "waiting" && !busy;
-  const phase = pickPhase(status, busy, sessionStatus);
-  const glow = { run: "var(--amber)", done: "var(--green)", wait: "var(--blue)", fail: "var(--red)", idle: "var(--amber)" }[phase];
-  const runLabel = busy ? "运行中…" : canFollow ? "发送下一句" : mode === "task" ? "运行 · 单发" : "开始对话";
 
   return (
-    <>
-      <div className="bg" style={{ "--glow": glow } as CSSProperties} />
-      <div className="shell">
-        {/* ---------- 侧栏:控制台 ---------- */}
-        <aside className="rail">
-          <div className="brand">
-            <div className="mark">e</div>
-            <div>
-              <h1>eve 会话调试台</h1>
-              <div className="tag">durable agent · mission control</div>
-            </div>
-          </div>
-          <a className="navlink" href="/sdk">eve/client SDK 演示 →</a>
-
-          <div className="card">
-            <p className="lbl">模式</p>
-            <div className="seg">
-              <button className={`task ${mode === "task" ? "on" : ""}`} onClick={() => setMode("task")}>
-                task
-                <span className="d">单发 → completed</span>
-              </button>
-              <button className={`conv ${mode === "conversation" ? "on" : ""}`} onClick={() => setMode("conversation")}>
-                conversation
-                <span className="d">多轮 → waiting</span>
-              </button>
-            </div>
-
-            <div style={{ marginTop: 15 }}>
-              <p className="lbl">{canFollow ? "下一句" : "消息"}</p>
-              <textarea
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                onKeyDown={(e) => {
-                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") send();
+    <div style={X.app}>
+      <aside style={X.rail}>
+        <button style={X.newBtn} onClick={newChat}>
+          ＋ 新建会话
+        </button>
+        <div style={X.list}>
+          {threads.length === 0 && <div style={X.listEmpty}>还没有会话</div>}
+          {threads.map((t) => (
+            <div key={t.id} style={{ ...X.sess, ...(t.id === activeId ? X.sessOn : {}) }} onClick={() => setActiveId(t.id)}>
+              <div style={X.sessMain}>
+                <div style={X.sessTitle}>{t.title}</div>
+                <div style={X.sessMeta}>{timeAgo(t.updatedAt)}</div>
+              </div>
+              <button
+                style={X.sessDel}
+                title="删除"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  del(t.id);
                 }}
-                placeholder="发给 agent 的内容…  ⌘/Ctrl+Enter 发送"
-              />
+              >
+                ×
+              </button>
             </div>
+          ))}
+        </div>
+        <div style={X.railFoot}>前端:eve/react useEveAgent · 原生 HITL</div>
+      </aside>
 
-            {mode === "task" && (
-              <label className="check">
-                <input type="checkbox" checked={useSchema} onChange={(e) => setUseSchema(e.target.checked)} />
-                带 outputSchema(结构化 result.completed)
-              </label>
-            )}
+      {activeId ? (
+        <ChatThread
+          key={activeId}
+          threadId={activeId}
+          initialEvents={active?.events ?? []}
+          initialSession={active?.session}
+          onPersist={upsert}
+        />
+      ) : (
+        <main style={X.main} />
+      )}
+    </div>
+  );
+}
 
-            <div className="actions">
-              {busy ? (
-                <button className="btn stop" onClick={stop}>
-                  ◼ 停止
-                </button>
-              ) : (
-                <button className="btn run" onClick={send} disabled={!message.trim()}>
-                  ▸ {runLabel}
-                </button>
-              )}
-              {sessionId && !busy && (
-                <button className="btn ghost" onClick={reset}>
-                  新会话
-                </button>
-              )}
-            </div>
+/* ================= 子:一个会话(useEveAgent) ================= */
 
-            {mode === "conversation" && sessionId && sessionStatus === "completed" && (
-              <p className="hint">conversation 竟然 completed 了?通常是 task 残留,点「新会话」重开。</p>
-            )}
-            {mode === "task" && sessionStatus === "completed" && (
-              <p className="hint">已终结 · task 会话不可续,续写请切 conversation。</p>
-            )}
-            {error && <p className="err">✗ {error}</p>}
+interface Opt {
+  id: string;
+  label: string;
+  description?: string;
+}
+interface IReq {
+  requestId: string;
+  prompt?: string;
+  display?: string;
+  options?: Opt[];
+}
+interface Part {
+  type: string;
+  text?: string;
+  toolName?: string;
+  input?: unknown;
+  toolMetadata?: { eve?: { inputRequest?: IReq } };
+}
+interface Msg {
+  id: string;
+  role: string;
+  parts: Part[];
+}
+
+function ChatThread({
+  threadId,
+  initialEvents,
+  initialSession,
+  onPersist,
+}: {
+  threadId: string;
+  initialEvents: HandleMessageStreamEvent[];
+  initialSession: SessionState | undefined;
+  onPersist: (t: SavedThread) => void;
+}) {
+  const agent = useEveAgent({
+    initialEvents,
+    initialSession,
+    onFinish(snap) {
+      const session = snap.session as SessionState | undefined;
+      const msgs = snap.data.messages as unknown as Msg[];
+      onPersist({
+        id: threadId,
+        title: firstUserText(msgs) || "新会话",
+        events: snap.events as HandleMessageStreamEvent[],
+        session,
+        updatedAt: Date.now(),
+      });
+    },
+  });
+
+  const [text, setText] = useState("");
+  const [answered, setAnswered] = useState<Set<string>>(new Set());
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const busy = agent.status === "submitted" || agent.status === "streaming";
+  const messages = agent.data.messages as unknown as Msg[];
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, busy]);
+
+  function submit() {
+    const m = text.trim();
+    if (!m || busy) return;
+    setText("");
+    void agent.send({ message: m });
+  }
+
+  function answer(req: IReq, optionId: string) {
+    if (busy) return;
+    setAnswered((prev) => new Set(prev).add(req.requestId));
+    void agent.send({ inputResponses: [{ requestId: req.requestId, optionId }] });
+  }
+
+  const title = firstUserText(messages) || "新会话";
+
+  return (
+    <main style={X.main}>
+      <header style={X.topbar}>
+        <div style={X.ttl}>{title}</div>
+        <span style={{ ...X.pill, ...pillStyle(agent.status) }}>{pillText(agent.status)}</span>
+      </header>
+
+      <div style={X.scroll} ref={scrollRef}>
+        {messages.length === 0 ? (
+          <div style={X.empty}>
+            <div style={X.emptyBig}>开始一个对话</div>
+            <div>输入消息即可。若模型用 ask_question 提问或工具需审批,会在这里出现可点的选项按钮。</div>
           </div>
-
-          {/* 会话历史 */}
-          {sessions.length > 0 && (
-            <div className="card">
-              <p className="lbl">会话历史 · {sessions.length}</p>
-              <div className="sess-list">
-                {sessions.map((s) => (
-                  <div
-                    key={s.sessionId}
-                    className={`sess ${s.sessionId === sessionId ? "on" : ""}`}
-                    onClick={() => loadSession(s)}
-                    title={s.sessionId}
-                  >
-                    <div className="sess-main">
-                      <div className="sess-title">{s.title}</div>
-                      <div className="sess-meta">
-                        <span className={`sess-badge ${s.mode}`}>{s.mode === "task" ? "task" : "conv"}</span>
-                        <span className={`sess-status ${s.status ?? ""}`}>{s.status ?? "—"}</span>
-                        <span>· {timeAgo(s.updatedAt)}</span>
+        ) : (
+          <div style={X.feed}>
+            {messages.map((m) => (
+              <div key={m.id} style={X.turn}>
+                {m.parts.map((p, i) => {
+                  // 文本
+                  if (p.type === "text" && p.text) {
+                    return m.role === "user" ? (
+                      <div key={i} style={X.rowUser}>
+                        <div style={X.bubbleUser}>{p.text}</div>
                       </div>
-                    </div>
-                    <button
-                      className="sess-del"
-                      title="删除"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteSession(s.sessionId);
-                      }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-              </div>
-              {mode === "conversation" && sessionId && sessionStatus === "waiting" && (
-                <p className="hint">当前会话停在 waiting,直接在上面输入框「发送下一句」即可续。task 会话是终态,加载后只读。</p>
-              )}
-            </div>
-          )}
-
-          {/* curl 面板 */}
-          <div className="card">
-            <div className="curl-head">
-              <p className="lbl" style={{ margin: 0 }}>对应 curl</p>
-              <CopyBtn text={buildCurl(mode, message, useSchema)} />
-            </div>
-            <pre className="code">{buildCurl(mode, message, useSchema)}</pre>
-            {sessionId && (
-              <>
-                <div className="curl-head">
-                  <p className="lbl" style={{ margin: 0 }}>看这个会话的流</p>
-                  <CopyBtn text={streamCurl(sessionId)} />
-                </div>
-                <pre className="code">{streamCurl(sessionId)}</pre>
-              </>
-            )}
-            {mode === "conversation" && sessionId && (
-              <>
-                <div className="curl-head">
-                  <p className="lbl" style={{ margin: 0 }}>续写(带 token)</p>
-                  <CopyBtn text={followCurl(sessionId)} />
-                </div>
-                <pre className="code">{followCurl(sessionId)}</pre>
-              </>
-            )}
-          </div>
-        </aside>
-
-        {/* ---------- 主区:会话流 ---------- */}
-        <main className="main">
-          <div className="topbar">
-            <span className={`pill ${phase === "idle" ? "" : phase}`}>
-              <span className="dot" />
-              {pillText(status, sessionStatus)}
-            </span>
-            <span className="meta-chip">
-              model <b>deepseek-chat</b>
-            </span>
-            {sessionId && (
-              <span className="meta-chip">
-                run <b>{sessionId.slice(0, 14)}…</b>
-              </span>
-            )}
-            {restored && <span className="meta-chip">· 已恢复上次会话</span>}
-            <span className="spacer" />
-            {(totalIn > 0 || totalOut > 0) && (
-              <span className="tok">
-                <span>in <b>{totalIn}</b></span>
-                <span>out <b>{totalOut}</b></span>
-              </span>
-            )}
-          </div>
-
-          <div className="stream" ref={streamRef}>
-            {turns.length === 0 ? (
-              <div className="empty">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.4">
-                  <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z" />
-                  <path d="M8 12h8M12 8v8" strokeLinecap="round" />
-                </svg>
-                <div className="big">等待第一条消息</div>
-                选好模式、写条消息,点运行。task 跑完即终结,conversation 会停在 waiting 等你续写。
-              </div>
-            ) : (
-              <div className="feed">
-                {turns.map((t, i) => (
-                  <div className="turn" key={t.turnId + "-" + i}>
-                    <div className="turn-head">turn · {t.turnId}</div>
-
-                    {t.user && (
-                      <div className="msg">
-                        <div className="ava user">你</div>
-                        <div className="body">
-                          <div className="bubble user-text">{t.user}</div>
+                    ) : (
+                      <div key={i} style={X.rowBot}>
+                        <div style={X.avatar}>e</div>
+                        <div style={X.bubbleBot}>{p.text}</div>
+                      </div>
+                    );
+                  }
+                  // HITL:input.requested(审批 or ask_question)
+                  const req = p.toolMetadata?.eve?.inputRequest;
+                  if (req) {
+                    const done = answered.has(req.requestId);
+                    return (
+                      <div key={i} style={X.rowBot}>
+                        <div style={X.avatar}>e</div>
+                        <div style={X.hitl}>
+                          <div style={X.hitlPrompt}>{req.display === "confirmation" ? "⏸ 需要审批" : "❓ 请选择"} · {req.prompt}</div>
+                          <div style={X.hitlOpts}>
+                            {(req.options ?? []).map((o) => {
+                              const deny = /deny|no|拒/i.test(o.id + o.label);
+                              return (
+                                <button
+                                  key={o.id}
+                                  disabled={done || busy}
+                                  style={{ ...X.optBtn, ...(deny ? X.optDeny : X.optOk), opacity: done ? 0.45 : 1 }}
+                                  onClick={() => answer(req, o.id)}
+                                  title={o.description}
+                                >
+                                  {o.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          {done && <div style={X.hitlDone}>已回复</div>}
                         </div>
                       </div>
-                    )}
-
-                    <div className="msg">
-                      <div className="ava bot">e</div>
-                      <div className="body">
-                        {t.reasoning && (
-                          <details className="reason" open={t.status === "running"}>
-                            <summary>思考过程</summary>
-                            <div className="reason-body">{t.reasoning}</div>
-                          </details>
-                        )}
-
-                        {t.blocks.map((b, bi) => (
-                          <div className="assistant" key={bi}>
-                            {b}
-                          </div>
-                        ))}
-                        {t.live && (
-                          <div className="assistant">
-                            {t.live}
-                            <span className="caret" />
-                          </div>
-                        )}
-                        {!t.blocks.length && !t.live && !t.tools.length && t.status === "running" && (
-                          <div className="assistant">
-                            <span className="caret" />
-                          </div>
-                        )}
-
-                        {t.tools.map((tool, ti) => (
-                          <div className="tool" key={ti}>
-                            <div className="tool-top">
-                              <span className="k">🔧 {tool.name}</span>
-                              <span className={`st ${tool.status}`}>{tool.status}</span>
-                            </div>
-                            {tool.input !== undefined && (
-                              <div className="io">
-                                <span className="rk">input </span>
-                                {short(tool.input)}
-                              </div>
-                            )}
-                            {tool.output !== undefined && (
-                              <div className="io out">
-                                <span className="rk">output </span>
-                                {short(tool.output)}
-                              </div>
-                            )}
-                          </div>
-                        ))}
-
-                        {t.result !== undefined && t.result !== null && (
-                          <div className="result-box">
-                            <div className="lbl2">result.completed</div>
-                            <pre>{short(t.result)}</pre>
-                          </div>
-                        )}
-
-                        {(t.usageIn > 0 || t.finishReason) && (
-                          <div className="turn-foot">
-                            {t.finishReason && <span className="fr">finish: {t.finishReason}</span>}
-                            {t.usageIn > 0 && (
-                              <span>
-                                in {t.usageIn} · out {t.usageOut} tok
-                              </span>
-                            )}
-                          </div>
-                        )}
+                    );
+                  }
+                  // 工具调用(非 HITL)
+                  if (p.type === "dynamic-tool" && p.toolName) {
+                    return (
+                      <div key={i} style={X.rowBot}>
+                        <div style={X.avatar}>e</div>
+                        <div style={X.tool}>🔧 {p.toolName}</div>
                       </div>
-                    </div>
-                  </div>
-                ))}
+                    );
+                  }
+                  return null;
+                })}
               </div>
-            )}
-
-            {events.length > 0 && (
-              <details className="raw">
-                <summary>原始事件流({events.length})</summary>
-                <div className="raw-grid">
-                  {events.map((e, i) => (
-                    <span key={i}>{e.type}</span>
-                  ))}
-                </div>
-              </details>
-            )}
+            ))}
+            {busy && <div style={X.typing}>生成中…</div>}
           </div>
-        </main>
+        )}
       </div>
-    </>
+
+      {agent.error && <div style={X.err}>✗ {agent.error.message}</div>}
+
+      <div style={X.composer}>
+        <div style={X.composerInner}>
+          <textarea
+            style={X.input}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                submit();
+              }
+            }}
+            placeholder="发条消息…（Enter 发送，Shift+Enter 换行）"
+            rows={1}
+          />
+          {busy ? (
+            <button style={{ ...X.sendBtn, ...X.stopBtn }} onClick={() => agent.stop()}>
+              ◼ 停止
+            </button>
+          ) : (
+            <button style={{ ...X.sendBtn, opacity: text.trim() ? 1 : 0.5 }} onClick={submit} disabled={!text.trim()}>
+              ↑ 发送
+            </button>
+          )}
+        </div>
+      </div>
+    </main>
   );
 }
 
-/* ---------------- helpers ---------------- */
+/* ================= helpers ================= */
 
-function CopyBtn({ text }: { text: string }) {
-  const [ok, setOk] = useState(false);
-  return (
-    <button
-      className="btn ghost mini"
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(text);
-          setOk(true);
-          setTimeout(() => setOk(false), 1200);
-        } catch {
-          /* ignore */
-        }
-      }}
-    >
-      {ok ? "已复制" : "复制"}
-    </button>
-  );
+function freshId(): string {
+  return "t" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 
-async function readJson<T>(res: Response): Promise<T> {
-  const text = await res.text();
-  if (!text) throw new Error(`空响应 (HTTP ${res.status}) —— 代理没拿到 body,多半是 eve 端点/网络代理的问题`);
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    throw new Error(`非 JSON 响应 (HTTP ${res.status}): ${text.slice(0, 200)}`);
-  }
-}
-
-function short(v: unknown): string {
-  const s = typeof v === "string" ? v : JSON.stringify(v, null, 2);
-  return s.length > 800 ? s.slice(0, 800) + "…" : s;
-}
-
-function firstUserMessage(events: EveEvent[]): string {
-  for (const ev of events) {
-    if (ev.type === "message.received") {
-      const m = (ev.data as { message?: string } | undefined)?.message;
-      if (m) return m.length > 40 ? m.slice(0, 40) + "…" : m;
+function firstUserText(messages: Msg[]): string {
+  for (const m of messages) {
+    if (m.role === "user") {
+      const p = m.parts.find((x) => x.type === "text" && x.text);
+      if (p?.text) return p.text.length > 32 ? p.text.slice(0, 32) + "…" : p.text;
     }
   }
   return "";
@@ -617,156 +331,62 @@ function timeAgo(ts: number): string {
   return `${Math.floor(s / 86400)} 天前`;
 }
 
-function pickPhase(status: Status, busy: boolean, sessionStatus: string | null): "run" | "done" | "wait" | "fail" | "idle" {
-  if (status === "error" || sessionStatus === "failed") return "fail";
-  if (busy) return "run";
-  if (sessionStatus === "completed") return "done";
-  if (sessionStatus === "waiting" || sessionStatus === "input") return "wait";
-  return "idle";
+type Status = "ready" | "submitted" | "streaming" | "error";
+function pillText(s: Status): string {
+  return { ready: "就绪", submitted: "提交中", streaming: "生成中…", error: "出错" }[s];
+}
+function pillStyle(s: Status): CSSProperties {
+  if (s === "error") return { color: "#c0392b", borderColor: "#f3c2bd" };
+  if (s === "submitted" || s === "streaming") return { color: "#b7791f", borderColor: "#ecd9a8" };
+  return { color: "#8a90a0", borderColor: "#dfe3ea" };
 }
 
-function pillText(status: Status, sessionStatus: string | null): string {
-  if (status === "submitted") return "SUBMITTING";
-  if (status === "streaming") return "STREAMING";
-  if (status === "error") return "ERROR";
-  if (sessionStatus === "completed") return "COMPLETED · 已终结";
-  if (sessionStatus === "waiting") return "WAITING · 可继续";
-  if (sessionStatus === "failed") return "FAILED";
-  if (sessionStatus === "input") return "INPUT REQUESTED";
-  return "READY";
-}
+/* ================= 内联样式(light) ================= */
 
-function deriveConsole(events: EveEvent[]): Derived {
-  const turns: Turn[] = [];
-  const byId = new Map<string, Turn>();
-  let sessionStatus: string | null = null;
-  let totalIn = 0;
-  let totalOut = 0;
+const X: Record<string, CSSProperties> = {
+  app: { height: "100%", display: "flex", background: "#f6f7f9", color: "#202430", fontFamily: "ui-sans-serif, system-ui, sans-serif", overflow: "hidden" },
+  rail: { width: 260, flexShrink: 0, borderRight: "1px solid #e4e7ee", background: "#eef0f4", display: "flex", flexDirection: "column", padding: 12, gap: 10 },
+  newBtn: { background: "#ffffff", border: "1px solid #d6dae2", color: "#2b303c", borderRadius: 10, padding: "10px 12px", fontSize: 14, fontWeight: 600, cursor: "pointer", textAlign: "left" },
+  list: { flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 },
+  listEmpty: { color: "#9aa0ae", fontSize: 13, padding: "12px 4px" },
+  sess: { display: "flex", gap: 6, alignItems: "center", padding: "8px 10px", borderRadius: 9, cursor: "pointer", border: "1px solid transparent" },
+  sessOn: { background: "#ffffff", border: "1px solid #cfd8ea", boxShadow: "0 1px 2px #0000000a" },
+  sessMain: { flex: 1, minWidth: 0 },
+  sessTitle: { fontSize: 13.5, color: "#333a48", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  sessMeta: { marginTop: 3, fontSize: 11, color: "#98a0b0" },
+  sessDel: { background: "none", border: "none", color: "#b6bcc8", cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px" },
+  railFoot: { borderTop: "1px solid #e4e7ee", paddingTop: 10, fontSize: 11, color: "#98a0b0", lineHeight: 1.5 },
 
-  const ensure = (id: string): Turn => {
-    let t = byId.get(id);
-    if (!t) {
-      t = { turnId: id, blocks: [], live: "", reasoning: "", tools: [], callIndex: {}, usageIn: 0, usageOut: 0, status: "running" };
-      byId.set(id, t);
-      turns.push(t);
-    }
-    return t;
-  };
+  main: { flex: 1, display: "flex", flexDirection: "column", minWidth: 0, background: "#ffffff" },
+  topbar: { display: "flex", alignItems: "center", gap: 12, padding: "14px 20px", borderBottom: "1px solid #eceef3" },
+  ttl: { fontSize: 15, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  pill: { marginLeft: "auto", flexShrink: 0, border: "1px solid", borderRadius: 999, padding: "4px 11px", fontSize: 12, fontWeight: 600 },
 
-  for (const ev of events) {
-    const d = (ev.data ?? {}) as Record<string, unknown>;
-    const id = typeof d.turnId === "string" ? d.turnId : undefined;
-    switch (ev.type) {
-      case "message.received":
-        if (id) ensure(id).user = d.message as string;
-        break;
-      case "message.appended":
-        if (id) {
-          const t = ensure(id);
-          t.live = (d.messageSoFar as string) ?? t.live;
-        }
-        break;
-      case "message.completed":
-        if (id) {
-          const t = ensure(id);
-          t.blocks.push((d.message as string) ?? t.live);
-          t.live = "";
-          if (typeof d.finishReason === "string") t.finishReason = d.finishReason;
-        }
-        break;
-      case "reasoning.appended":
-        if (id) {
-          const t = ensure(id);
-          t.reasoning = (d.reasoningSoFar as string) ?? (d.textSoFar as string) ?? t.reasoning;
-        }
-        break;
-      case "reasoning.completed":
-        if (id) {
-          const t = ensure(id);
-          t.reasoning = (d.reasoning as string) ?? (d.text as string) ?? t.reasoning;
-        }
-        break;
-      case "actions.requested":
-        if (id) {
-          const t = ensure(id);
-          const actions = (d.actions as Array<Record<string, unknown>>) ?? [];
-          for (const a of actions) {
-            t.callIndex[a.callId as string] = t.tools.length;
-            t.tools.push({ name: (a.toolName as string) ?? "tool", input: a.input, status: "running" });
-          }
-        }
-        break;
-      case "action.result":
-        if (id) {
-          const t = ensure(id);
-          const r = (d.result as Record<string, unknown>) ?? {};
-          const idx = t.callIndex[r.callId as string];
-          if (idx !== undefined) {
-            t.tools[idx].output = r.output;
-            t.tools[idx].status = d.status === "failed" ? "failed" : "done";
-          }
-        }
-        break;
-      case "result.completed":
-        if (id) ensure(id).result = d.result;
-        break;
-      case "step.completed":
-        if (id) {
-          const t = ensure(id);
-          const u = (d.usage as Record<string, number>) ?? {};
-          t.usageIn += u.inputTokens ?? 0;
-          t.usageOut += u.outputTokens ?? 0;
-          totalIn += u.inputTokens ?? 0;
-          totalOut += u.outputTokens ?? 0;
-        }
-        break;
-      case "turn.completed":
-        if (id) ensure(id).status = "completed";
-        break;
-      case "turn.failed":
-        if (id) ensure(id).status = "failed";
-        break;
-      case "session.started":
-        sessionStatus = "started";
-        break;
-      case "session.waiting":
-        sessionStatus = "waiting";
-        break;
-      case "session.completed":
-        sessionStatus = "completed";
-        break;
-      case "session.failed":
-        sessionStatus = "failed";
-        break;
-      case "input.requested":
-        sessionStatus = "input";
-        break;
-    }
-  }
-  return { turns, sessionStatus, totalIn, totalOut };
-}
+  scroll: { flex: 1, overflowY: "auto", padding: "20px 0" },
+  empty: { maxWidth: 520, margin: "12vh auto 0", textAlign: "center", color: "#98a0b0", fontSize: 14, lineHeight: 1.6 },
+  emptyBig: { fontSize: 20, color: "#4a505e", fontWeight: 600, marginBottom: 8 },
+  feed: { maxWidth: 760, margin: "0 auto", padding: "0 20px", display: "flex", flexDirection: "column", gap: 14 },
+  turn: { display: "flex", flexDirection: "column", gap: 10 },
+  rowUser: { display: "flex", justifyContent: "flex-end" },
+  bubbleUser: { maxWidth: "78%", background: "#2563eb", color: "#fff", padding: "10px 14px", borderRadius: "14px 14px 4px 14px", fontSize: 14.5, lineHeight: 1.55, whiteSpace: "pre-wrap", wordBreak: "break-word" },
+  rowBot: { display: "flex", gap: 10, alignItems: "flex-start" },
+  avatar: { width: 28, height: 28, flexShrink: 0, borderRadius: 8, background: "#eef0f4", border: "1px solid #dbe0ea", display: "grid", placeItems: "center", fontSize: 13, fontWeight: 700, color: "#5a6b8c" },
+  bubbleBot: { background: "#f4f6fa", border: "1px solid #e6e9f0", color: "#2b303c", padding: "10px 14px", borderRadius: "14px 14px 14px 4px", fontSize: 14.5, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", maxWidth: "88%" },
+  tool: { background: "#f0f2f6", border: "1px solid #e3e6ee", borderRadius: 9, padding: "7px 11px", fontSize: 12.5, color: "#4a505e" },
 
-function buildCurl(mode: Mode, message: string, useSchema: boolean): string {
-  const payload: Record<string, unknown> = { mode, message: message || "你的消息" };
-  if (mode === "task" && useSchema) payload.outputSchema = DEMO_SCHEMA;
-  return [
-    `curl -s -X POST "${EVE_BASE}/eve/v1/session" \\`,
-    `  -H 'content-type: application/json' \\`,
-    `  -d '${JSON.stringify(payload)}'`,
-  ].join("\n");
-}
+  hitl: { background: "#eef3ff", border: "1px solid #cdddfb", borderRadius: 12, padding: "12px 14px", maxWidth: "88%", display: "flex", flexDirection: "column", gap: 10 },
+  hitlPrompt: { fontSize: 14, color: "#20386b", fontWeight: 500, lineHeight: 1.5 },
+  hitlOpts: { display: "flex", gap: 8, flexWrap: "wrap" },
+  optBtn: { border: "none", borderRadius: 9, padding: "8px 14px", fontSize: 13.5, fontWeight: 600, cursor: "pointer" },
+  optOk: { background: "#2563eb", color: "#fff" },
+  optDeny: { background: "#fdecea", color: "#c0392b", border: "1px solid #f3c2bd" },
+  hitlDone: { fontSize: 12, color: "#6b7280" },
+  typing: { color: "#98a0b0", fontSize: 13, padding: "2px 4px 0 48px" },
 
-function streamCurl(sid: string): string {
-  return [
-    `curl -s "${EVE_BASE}/eve/v1/session/${sid}/stream?startIndex=0" \\`,
-    `  | grep -vE '"type":"(message|reasoning).appended"'`,
-  ].join("\n");
-}
-
-function followCurl(sid: string): string {
-  return [
-    `curl -s -X POST "${EVE_BASE}/eve/v1/session/${sid}" \\`,
-    `  -H 'content-type: application/json' \\`,
-    `  -d '{"continuationToken":"<上一轮返回的 token>","message":"接着聊"}'`,
-  ].join("\n");
-}
+  err: { maxWidth: 760, margin: "0 auto", width: "100%", padding: "8px 20px", color: "#c0392b", fontSize: 13 },
+  composer: { padding: "14px 20px 18px", borderTop: "1px solid #eceef3" },
+  composerInner: { maxWidth: 760, margin: "0 auto", display: "flex", gap: 10, alignItems: "flex-end" },
+  input: { flex: 1, minWidth: 0, background: "#ffffff", border: "1px solid #d6dae2", borderRadius: 12, padding: "12px 14px", color: "#202430", fontSize: 14.5, outline: "none", resize: "none", minHeight: 46, maxHeight: 180, lineHeight: 1.5, fontFamily: "inherit" },
+  sendBtn: { flexShrink: 0, background: "#2563eb", color: "#fff", border: "none", borderRadius: 12, padding: "12px 18px", fontSize: 14, fontWeight: 600, cursor: "pointer" },
+  stopBtn: { background: "#fdecea", color: "#c0392b", border: "1px solid #f3c2bd" },
+};
